@@ -285,6 +285,33 @@ fn estimate_history_size_chars(history: &[AugmentChatHistory]) -> usize {
   history.iter().map(estimate_exchange_size_chars).sum()
 }
 
+fn estimate_request_extra_size_chars(augment: &AugmentRequest) -> usize {
+  let ctx = augment.context.as_ref();
+
+  let prefix = if !augment.prefix.trim().is_empty() {
+    augment.prefix.as_str()
+  } else {
+    ctx.map(|c| c.prefix.as_str()).unwrap_or("")
+  };
+  let selected_code = if !augment.selected_code.trim().is_empty() {
+    augment.selected_code.as_str()
+  } else {
+    ctx.map(|c| c.selected_code.as_str()).unwrap_or("")
+  };
+  let suffix = if !augment.suffix.trim().is_empty() {
+    augment.suffix.as_str()
+  } else {
+    ctx.map(|c| c.suffix.as_str()).unwrap_or("")
+  };
+  let diff = if !augment.diff.trim().is_empty() {
+    augment.diff.as_str()
+  } else {
+    ctx.map(|c| c.diff.as_str()).unwrap_or("")
+  };
+
+  prefix.len() + selected_code.len() + suffix.len() + diff.len()
+}
+
 #[derive(Debug, Clone)]
 struct HistorySplit {
   head: Vec<AugmentChatHistory>,
@@ -796,23 +823,28 @@ async fn run_summary_model_once(
   timeout_seconds: u64,
   model: String,
 ) -> anyhow::Result<(String, String)> {
-  let augment = AugmentRequest {
-    model: None,
-    chat_history,
-    message: prompt.to_string(),
-    agent_memories: String::new(),
-    mode: String::new(),
-    prefix: String::new(),
-    suffix: String::new(),
-    lang: String::new(),
-    path: String::new(),
-    user_guidelines: String::new(),
-    tool_definitions: Vec::new(),
-    nodes: Vec::new(),
-    structured_request_nodes: Vec::new(),
-    request_nodes: Vec::new(),
-    conversation_id: None,
-  };
+	  let augment = AugmentRequest {
+	    model: None,
+	    chat_history,
+	    message: prompt.to_string(),
+	    agent_memories: String::new(),
+	    mode: String::new(),
+	    prefix: String::new(),
+	    selected_code: String::new(),
+	    suffix: String::new(),
+	    diff: String::new(),
+	    lang: String::new(),
+	    path: String::new(),
+	    user_guidelines: String::new(),
+	    workspace_guidelines: String::new(),
+	    rules: Value::Null,
+	    tool_definitions: Vec::new(),
+	    nodes: Vec::new(),
+	    structured_request_nodes: Vec::new(),
+	    request_nodes: Vec::new(),
+	    conversation_id: None,
+	    context: None,
+	  };
 
   match provider {
     SummaryProviderRef::Anthropic(p) => {
@@ -951,7 +983,9 @@ pub async fn maybe_summarize_and_compact(
   }
 
   let total_chars = estimate_history_size_chars(&augment.chat_history);
-  let total_with_extra = total_chars.saturating_add(augment.message.len());
+  let total_with_extra = total_chars
+    .saturating_add(augment.message.len())
+    .saturating_add(estimate_request_extra_size_chars(augment));
 
   let strategy = hs.trigger_strategy.trim().to_ascii_lowercase();
   let cw_tokens_raw = resolve_context_window_tokens(hs, requested_model);

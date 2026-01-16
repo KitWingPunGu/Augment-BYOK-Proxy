@@ -629,21 +629,31 @@ async fn chat_stream(
               }
             }
 
-            if let Some(calls) = choice.delta.tool_calls.as_ref() {
-              for c in calls {
-                let idx = c.index.unwrap_or(0);
-                let id = c.id.as_deref();
-                let name = c.function.as_ref().and_then(|f| f.name.as_deref());
-                let args = c.function.as_ref().and_then(|f| f.arguments.as_deref());
-                state_machine.on_tool_call_delta(idx, id, name, args);
-              }
-            }
+	            if let Some(calls) = choice.delta.tool_calls.as_ref() {
+	              for c in calls {
+	                let idx = c.index.unwrap_or(0);
+	                let id = c.id.as_deref();
+	                let name = c.function.as_ref().and_then(|f| f.name.as_deref());
+	                let args = c.function.as_ref().and_then(|f| f.arguments.as_deref());
+	                if let Some(chunk) = state_machine.on_tool_call_delta(idx, id, name, args) {
+	                  if let Ok(line) = serde_json::to_string(&chunk) {
+	                    emitted_chunks += 1;
+	                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
+	                  }
+	                }
+	              }
+	            }
 
-            if let Some(fc) = choice.delta.function_call.as_ref() {
-              let name = fc.name.as_deref();
-              let args = fc.arguments.as_deref();
-              state_machine.on_tool_call_delta(0, None, name, args);
-            }
+	            if let Some(fc) = choice.delta.function_call.as_ref() {
+	              let name = fc.name.as_deref();
+	              let args = fc.arguments.as_deref();
+	              if let Some(chunk) = state_machine.on_tool_call_delta(0, None, name, args) {
+	                if let Ok(line) = serde_json::to_string(&chunk) {
+	                  emitted_chunks += 1;
+	                  yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
+	                }
+	              }
+	            }
 
             if let Some(r) = choice.finish_reason.as_deref() {
               state_machine.on_finish_reason(r);
@@ -683,36 +693,12 @@ async fn chat_stream(
   }
 }
 
-fn normalize_endpoint_path(ep: &str) -> String {
-  let s = ep.trim();
-  if s.is_empty() {
-    return String::new();
-  }
-  let mut p = if s.starts_with('/') {
-    s.to_string()
-  } else {
-    format!("/{s}")
-  };
-  while p.ends_with('/') && p.len() > 1 {
-    p.pop();
-  }
-  p
-}
-
 fn json_string(v: Option<&serde_json::Value>) -> String {
   match v {
     Some(serde_json::Value::String(s)) => s.trim().to_string(),
     Some(serde_json::Value::Null) => String::new(),
     Some(other) => other.as_str().unwrap_or("").trim().to_string(),
     None => String::new(),
-  }
-}
-
-fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
-  match v {
-    Some(serde_json::Value::Number(n)) => n.as_i64(),
-    Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().ok(),
-    _ => None,
   }
 }
 

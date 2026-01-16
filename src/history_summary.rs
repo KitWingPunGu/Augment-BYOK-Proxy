@@ -3,7 +3,8 @@ use serde_json::Value;
 
 use crate::protocol::{
   AugmentChatHistory, NodeIn, TextNode, REQUEST_NODE_HISTORY_SUMMARY, REQUEST_NODE_TEXT,
-  REQUEST_NODE_TOOL_RESULT, RESPONSE_NODE_RAW_RESPONSE, RESPONSE_NODE_THINKING, RESPONSE_NODE_TOOL_USE,
+  REQUEST_NODE_TOOL_RESULT, RESPONSE_NODE_MAIN_TEXT_FINISHED, RESPONSE_NODE_RAW_RESPONSE,
+  RESPONSE_NODE_THINKING, RESPONSE_NODE_TOOL_USE,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,8 +25,6 @@ struct HistorySummaryNode {
 
 #[derive(Debug, Clone, Deserialize)]
 struct HistoryEndExchange {
-  #[serde(default, alias = "requestId")]
-  request_id: String,
   #[serde(default, alias = "requestMessage")]
   request_message: String,
   #[serde(default, alias = "responseText")]
@@ -121,13 +120,19 @@ fn build_exchange_render_ctx(ex: &HistoryEndExchange) -> ExchangeRenderCtx {
     }
   }));
 
-  let response_text = normalize_joined_lines(ex.response_nodes.iter().filter_map(|n| {
-    if n.node_type == RESPONSE_NODE_RAW_RESPONSE && !n.content.trim().is_empty() {
-      Some(n.content.clone())
-    } else {
-      None
+  let mut finished_text: Option<String> = None;
+  let mut raw = String::new();
+  for n in &ex.response_nodes {
+    if n.node_type == RESPONSE_NODE_MAIN_TEXT_FINISHED && !n.content.trim().is_empty() {
+      finished_text = Some(n.content.clone());
+    } else if n.node_type == RESPONSE_NODE_RAW_RESPONSE && !n.content.trim().is_empty() {
+      raw.push_str(&n.content);
     }
-  }));
+  }
+  let mut response_text = finished_text.unwrap_or(raw).trim().to_string();
+  if response_text.is_empty() && !ex.response_text.trim().is_empty() {
+    response_text = ex.response_text.trim().to_string();
+  }
 
   let tool_uses: Vec<ToolUseCtx> = ex
     .response_nodes
@@ -227,7 +232,6 @@ pub fn render_history_summary_node_value(v: &Value, extra_tool_results: &[NodeIn
 
   if !extra_tool_results.is_empty() {
     node.history_end.push(HistoryEndExchange {
-      request_id: String::new(),
       request_message: String::new(),
       response_text: String::new(),
       request_nodes: extra_tool_results.to_vec(),
@@ -312,16 +316,16 @@ pub fn compact_chat_history(chat_history: &mut Vec<AugmentChatHistory>) {
     .cloned()
     .collect();
 
+  let Some(text) = render_history_summary_node_value(&summary_value, &tool_results) else {
+    // 无法渲染时，不做破坏性改写；仅保留裁剪 chat_history 的行为。
+    first.request_nodes = req_nodes;
+    return;
+  };
+
   let mut other_nodes: Vec<NodeIn> = req_nodes
     .into_iter()
     .filter(|n| n.node_type != REQUEST_NODE_HISTORY_SUMMARY && n.node_type != REQUEST_NODE_TOOL_RESULT)
     .collect();
-
-  let Some(text) = render_history_summary_node_value(&summary_value, &tool_results) else {
-    // 无法渲染时，不做破坏性改写；仅保留裁剪 chat_history 的行为。
-    first.request_nodes = other_nodes;
-    return;
-  };
 
   let summary_text_node = NodeIn {
     id: summary_id,
@@ -505,6 +509,106 @@ Beginning part has {beginning_part_dropped_num_exchanges} exchanges.
         .iter()
         .any(|n| n.node_type == REQUEST_NODE_HISTORY_SUMMARY),
       "history_summary node should be removed from request_nodes"
+    );
+  }
+
+  #[test]
+  fn compact_chat_history_keeps_nodes_when_render_fails() {
+    let summary = serde_json::json!({
+      "summary_text": "S",
+      "summarization_request_id": "req",
+      "history_beginning_dropped_num_exchanges": 1,
+      "history_middle_abridged_text": "",
+      "history_end": [],
+      "message_template": ""
+    });
+
+    let tool_result = NodeIn {
+      id: 2,
+      node_type: REQUEST_NODE_TOOL_RESULT,
+      content: String::new(),
+      text_node: None,
+      tool_result_node: Some(ToolResultNode {
+        tool_use_id: "tool-1".to_string(),
+        content: "RESULT".to_string(),
+        content_nodes: vec![crate::protocol::ToolResultContentNode {
+          node_type: TOOL_RESULT_CONTENT_NODE_TEXT,
+          text_content: "RESULT".to_string(),
+          image_content: None,
+        }],
+        is_error: false,
+      }),
+      image_node: None,
+      image_id_node: None,
+      ide_state_node: None,
+      edit_events_node: None,
+      checkpoint_ref_node: None,
+      change_personality_node: None,
+      file_node: None,
+      file_id_node: None,
+      history_summary_node: None,
+      tool_use: None,
+      thinking: None,
+    };
+
+    let summary_node = NodeIn {
+      id: 1,
+      node_type: REQUEST_NODE_HISTORY_SUMMARY,
+      content: String::new(),
+      text_node: None,
+      tool_result_node: None,
+      image_node: None,
+      image_id_node: None,
+      ide_state_node: None,
+      edit_events_node: None,
+      checkpoint_ref_node: None,
+      change_personality_node: None,
+      file_node: None,
+      file_id_node: None,
+      history_summary_node: Some(summary),
+      tool_use: None,
+      thinking: None,
+    };
+
+    let mut chat_history = vec![
+      AugmentChatHistory {
+        response_text: "old".to_string(),
+        request_message: "old".to_string(),
+        request_id: "r0".to_string(),
+        request_nodes: Vec::new(),
+        structured_request_nodes: Vec::new(),
+        nodes: Vec::new(),
+        response_nodes: Vec::new(),
+        structured_output_nodes: Vec::new(),
+      },
+      AugmentChatHistory {
+        response_text: "".to_string(),
+        request_message: "".to_string(),
+        request_id: "r1".to_string(),
+        request_nodes: vec![summary_node, tool_result],
+        structured_request_nodes: Vec::new(),
+        nodes: Vec::new(),
+        response_nodes: Vec::new(),
+        structured_output_nodes: Vec::new(),
+      },
+    ];
+
+    compact_chat_history(&mut chat_history);
+
+    assert_eq!(chat_history.len(), 1);
+    assert!(
+      chat_history[0]
+        .request_nodes
+        .iter()
+        .any(|n| n.node_type == REQUEST_NODE_HISTORY_SUMMARY),
+      "render failed -> should keep history_summary node"
+    );
+    assert!(
+      chat_history[0]
+        .request_nodes
+        .iter()
+        .any(|n| n.node_type == REQUEST_NODE_TOOL_RESULT),
+      "render failed -> should keep tool_result nodes"
     );
   }
 }

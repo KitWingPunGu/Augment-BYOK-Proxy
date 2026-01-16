@@ -14,7 +14,7 @@ use crate::{
     OpenAITool, OpenAIToolCall,
   },
 	  protocol::{
-	    AugmentChatHistory, AugmentRequest, NodeIn, NodeOut, ThinkingNode, TokenUsageNode,
+	    AugmentChatHistory, AugmentRequest, NodeIn, NodeOut, TextNode, ThinkingNode, TokenUsageNode,
 	    ToolDefinition, ToolResultContentNode, ToolUse, REQUEST_NODE_CHANGE_PERSONALITY,
 	    REQUEST_NODE_CHECKPOINT_REF, REQUEST_NODE_EDIT_EVENTS, REQUEST_NODE_FILE, REQUEST_NODE_FILE_ID,
 	    REQUEST_NODE_HISTORY_SUMMARY, REQUEST_NODE_IDE_STATE, REQUEST_NODE_IMAGE,
@@ -88,20 +88,22 @@ pub fn convert_augment_to_anthropic(
     )?;
   }
 
-  let current_nodes = augment
-    .nodes
-    .iter()
-    .chain(&augment.structured_request_nodes)
-    .chain(&augment.request_nodes);
-  if !augment.message.is_empty() || current_nodes.clone().next().is_some() {
-    let user_content = build_user_content_blocks(&augment.message, current_nodes, true)?;
-    if !user_content.is_empty() {
-      messages.push(AnthropicMessage {
-        role: "user".to_string(),
-        content: user_content,
-      });
-    }
-  }
+	  let virtual_nodes = build_virtual_context_text_nodes(augment);
+	  let current_nodes = augment
+	    .nodes
+	    .iter()
+	    .chain(&augment.structured_request_nodes)
+	    .chain(&augment.request_nodes)
+	    .chain(virtual_nodes.iter());
+	  if !augment.message.is_empty() || current_nodes.clone().next().is_some() {
+	    let user_content = build_user_content_blocks(&augment.message, current_nodes, true)?;
+	    if !user_content.is_empty() {
+	      messages.push(AnthropicMessage {
+	        role: "user".to_string(),
+	        content: user_content,
+	      });
+	    }
+	  }
 
   let tools = convert_tools(&augment.tool_definitions)?;
   let tool_choice = (!tools.is_empty()).then(|| AnthropicToolChoice {
@@ -172,12 +174,18 @@ fn build_openai_user_segments<'a>(
 ) -> anyhow::Result<Vec<OpenAISegment>> {
   let mut segments: Vec<OpenAISegment> = Vec::new();
   let mut last_text: Option<String> = None;
+  let message_trimmed = message.trim();
+  let skip_message_text = (!message_trimmed.is_empty() && !is_user_placeholder_message(message_trimmed))
+    .then_some(message_trimmed);
   push_openai_text_segment(&mut segments, &mut last_text, message);
 
   for node in nodes {
     match node.node_type {
       REQUEST_NODE_TEXT => {
         if let Some(t) = &node.text_node {
+          if skip_message_text == Some(t.content.trim()) {
+            continue;
+          }
           push_openai_text_segment(&mut segments, &mut last_text, &t.content);
         }
       }
@@ -543,6 +551,8 @@ pub fn convert_augment_to_openai_compatible(
     .chain(&augment.structured_request_nodes)
     .chain(&augment.request_nodes)
     .collect();
+  let virtual_nodes = build_virtual_context_text_nodes(augment);
+  current_nodes.extend(virtual_nodes.iter());
 
   messages.extend(build_openai_tool_messages_from_request_nodes(
     current_nodes.iter().copied(),
@@ -579,11 +589,25 @@ pub fn convert_augment_to_openai_compatible(
 
 fn build_system_prompt(augment: &AugmentRequest) -> String {
   let mut parts: Vec<String> = Vec::new();
-  if !augment.prefix.trim().is_empty() {
-    parts.push(augment.prefix.trim().to_string());
-  }
   if !augment.user_guidelines.trim().is_empty() {
     parts.push(augment.user_guidelines.trim().to_string());
+  }
+  if !augment.workspace_guidelines.trim().is_empty() {
+    parts.push(augment.workspace_guidelines.trim().to_string());
+  }
+  let rules_text = match &augment.rules {
+    Value::String(s) => s.trim().to_string(),
+    Value::Array(arr) => arr
+      .iter()
+      .filter_map(|x| x.as_str())
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .collect::<Vec<_>>()
+      .join("\n"),
+    _ => String::new(),
+  };
+  if !rules_text.trim().is_empty() {
+    parts.push(rules_text);
   }
   if !augment.agent_memories.trim().is_empty() {
     parts.push(augment.agent_memories.trim().to_string());
@@ -592,18 +616,97 @@ fn build_system_prompt(augment: &AugmentRequest) -> String {
     parts.push(
 			"You are an AI coding assistant with access to tools. Use tools when needed to complete tasks."
 				.to_string(),
-		);
+			);
   }
-  if !augment.lang.trim().is_empty() {
-    parts.push(format!(
-      "The user is working with {} code.",
-      augment.lang.trim()
-    ));
+  let ctx = augment.context.as_ref();
+  let lang = augment.lang.trim();
+  let lang = if lang.is_empty() {
+    ctx.map(|c| c.lang.trim()).unwrap_or("")
+  } else {
+    lang
+  };
+  if !lang.is_empty() {
+    parts.push(format!("The user is working with {} code.", lang));
   }
-  if !augment.path.trim().is_empty() {
-    parts.push(format!("Current file path: {}", augment.path.trim()));
+  let path = augment.path.trim();
+  let path = if path.is_empty() {
+    ctx.map(|c| c.path.trim()).unwrap_or("")
+  } else {
+    path
+  };
+  if !path.is_empty() {
+    parts.push(format!("Current file path: {}", path));
   }
   parts.join("\n\n")
+}
+
+fn build_virtual_context_text_nodes(augment: &AugmentRequest) -> Vec<NodeIn> {
+  let ctx = augment.context.as_ref();
+  let message = augment.message.trim();
+
+  let prefix = if !augment.prefix.trim().is_empty() {
+    augment.prefix.trim()
+  } else {
+    ctx.map(|c| c.prefix.trim()).unwrap_or("")
+  };
+  let selected_code = if !augment.selected_code.trim().is_empty() {
+    augment.selected_code.trim()
+  } else {
+    ctx.map(|c| c.selected_code.trim()).unwrap_or("")
+  };
+  let suffix = if !augment.suffix.trim().is_empty() {
+    augment.suffix.trim()
+  } else {
+    ctx.map(|c| c.suffix.trim()).unwrap_or("")
+  };
+
+  let code = format!("{prefix}{selected_code}{suffix}").trim().to_string();
+  let diff = if !augment.diff.trim().is_empty() {
+    augment.diff.trim()
+  } else {
+    ctx.map(|c| c.diff.trim()).unwrap_or("")
+  }
+  .trim()
+  .to_string();
+
+  let mut next_id: i32 = 1_000_000;
+  let mut out: Vec<NodeIn> = Vec::new();
+  let mut push_text = |out: &mut Vec<NodeIn>, s: String| {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || is_user_placeholder_message(trimmed) {
+      return;
+    }
+    next_id += 1;
+    out.push(NodeIn {
+      id: next_id,
+      node_type: REQUEST_NODE_TEXT,
+      content: String::new(),
+      text_node: Some(TextNode {
+        content: trimmed.to_string(),
+      }),
+      tool_result_node: None,
+      image_node: None,
+      image_id_node: None,
+      ide_state_node: None,
+      edit_events_node: None,
+      checkpoint_ref_node: None,
+      change_personality_node: None,
+      file_node: None,
+      file_id_node: None,
+      history_summary_node: None,
+      tool_use: None,
+      thinking: None,
+    });
+  };
+
+  if !code.is_empty() && code != message {
+    push_text(&mut out, code.clone());
+  }
+  if !diff.is_empty() && diff != message && diff != code {
+    push_text(&mut out, diff);
+  }
+
+  out
 }
 
 fn push_history_messages(
@@ -667,12 +770,20 @@ fn build_user_content_blocks<'a>(
 ) -> anyhow::Result<Vec<AnthropicContentBlock>> {
   let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
   let mut last_text: Option<String> = None;
+  let message_trimmed = message.trim();
+  let skip_message_text = (!message_trimmed.is_empty() && !is_user_placeholder_message(message_trimmed))
+    .then_some(message_trimmed);
   push_text_block(&mut blocks, &mut last_text, message);
 
   for node in nodes {
     match node.node_type {
       REQUEST_NODE_TEXT => {
-        push_text_block_from_request_text_node(&mut blocks, &mut last_text, node)
+        if let Some(t) = &node.text_node {
+          if skip_message_text == Some(t.content.trim()) {
+            continue;
+          }
+          push_text_block(&mut blocks, &mut last_text, &t.content);
+        }
       }
       REQUEST_NODE_TOOL_RESULT => {
         if include_tool_results {
@@ -959,16 +1070,6 @@ fn image_block_from_format_and_data(format: i32, data: &str) -> AnthropicContent
     is_error: None,
     thinking: None,
     signature: None,
-  }
-}
-
-fn push_text_block_from_request_text_node(
-  blocks: &mut Vec<AnthropicContentBlock>,
-  last_text: &mut Option<String>,
-  node: &NodeIn,
-) {
-  if let Some(t) = &node.text_node {
-    push_text_block(blocks, last_text, &t.content);
   }
 }
 
@@ -1733,6 +1834,7 @@ pub struct OpenAIToolCallBuffer {
   pub arguments: String,
   pub mcp_server_name: String,
   pub mcp_tool_name: String,
+  pub started: bool,
 }
 
 impl OpenAIStreamState {
@@ -1771,7 +1873,7 @@ impl OpenAIStreamState {
     id: Option<&str>,
     name: Option<&str>,
     arguments: Option<&str>,
-  ) {
+  ) -> Option<crate::protocol::AugmentStreamChunk> {
     let entry = self
       .tool_calls
       .entry(index)
@@ -1796,6 +1898,39 @@ impl OpenAIStreamState {
     if let Some(args) = arguments {
       entry.arguments.push_str(args);
     }
+
+    let name = entry.name.trim();
+    if name.is_empty() || entry.started {
+      return None;
+    }
+    if entry.id.trim().is_empty() {
+      entry.id = format!("tool-{}", index + 1);
+    }
+
+    entry.started = true;
+    self.saw_tool_use = true;
+    self.node_id += 1;
+    Some(crate::protocol::AugmentStreamChunk {
+      text: "".to_string(),
+      unknown_blob_names: Vec::new(),
+      checkpoint_not_found: false,
+      workspace_file_chunks: Vec::new(),
+      nodes: vec![NodeOut {
+        id: self.node_id,
+        node_type: RESPONSE_NODE_TOOL_USE_START,
+        content: "".to_string(),
+        tool_use: Some(ToolUse {
+          tool_use_id: entry.id.trim().to_string(),
+          tool_name: name.to_string(),
+          input_json: "{}".to_string(),
+          mcp_server_name: entry.mcp_server_name.clone(),
+          mcp_tool_name: entry.mcp_tool_name.clone(),
+        }),
+        thinking: None,
+        token_usage: None,
+      }],
+      stop_reason: None,
+    })
   }
 
   pub fn on_finish_reason(&mut self, finish_reason: &str) {
@@ -1806,16 +1941,17 @@ impl OpenAIStreamState {
   pub fn finalize(&mut self) -> Vec<crate::protocol::AugmentStreamChunk> {
     let mut chunks: Vec<crate::protocol::AugmentStreamChunk> = Vec::new();
 
-    let mut indices: Vec<usize> = self.tool_calls.keys().copied().collect();
-    indices.sort();
-    for idx in indices {
-      let Some(call) = self.tool_calls.get(&idx) else {
-        continue;
-      };
-      let name = call.name.trim();
-      if name.is_empty() {
-        continue;
-      }
+	    let mut indices: Vec<usize> = self.tool_calls.keys().copied().collect();
+	    indices.sort();
+	    for idx in indices {
+	      let Some(call) = self.tool_calls.get(&idx) else {
+	        continue;
+	      };
+	      let name = call.name.trim();
+	      let started = call.started;
+	      if name.is_empty() {
+	        continue;
+	      }
       let mut id = call.id.trim().to_string();
       if id.is_empty() {
         id = format!("tool-{}", self.node_id + 1);
@@ -1847,26 +1983,28 @@ impl OpenAIStreamState {
         stop_reason: None,
       };
 
-      self.node_id += 1;
-      chunks.push(mk_chunk(NodeOut {
-        id: self.node_id,
-        node_type: RESPONSE_NODE_TOOL_USE_START,
-        content: "".to_string(),
-        tool_use: Some(tool_use.clone()),
-        thinking: None,
-        token_usage: None,
-      }));
+	      if !started {
+	        self.node_id += 1;
+	        chunks.push(mk_chunk(NodeOut {
+	          id: self.node_id,
+	          node_type: RESPONSE_NODE_TOOL_USE_START,
+	          content: "".to_string(),
+	          tool_use: Some(tool_use.clone()),
+	          thinking: None,
+	          token_usage: None,
+	        }));
+	      }
 
-      self.node_id += 1;
-      chunks.push(mk_chunk(NodeOut {
-        id: self.node_id,
-        node_type: RESPONSE_NODE_TOOL_USE,
-        content: "".to_string(),
-        tool_use: Some(tool_use),
-        thinking: None,
-        token_usage: None,
-      }));
-    }
+	      self.node_id += 1;
+	      chunks.push(mk_chunk(NodeOut {
+	        id: self.node_id,
+	        node_type: RESPONSE_NODE_TOOL_USE,
+	        content: "".to_string(),
+	        tool_use: Some(tool_use),
+	        thinking: None,
+	        token_usage: None,
+	      }));
+	    }
 
     if self.usage_input_tokens.is_some() || self.usage_output_tokens.is_some() {
       self.node_id += 1;
@@ -1928,11 +2066,11 @@ impl OpenAIStreamState {
 mod tests {
   use super::*;
   use crate::config::{AnthropicProviderConfig, OpenAICompatibleProviderConfig, ThinkingConfig};
-  use crate::protocol::{
-    AugmentChatHistory, AugmentRequest, NodeIn, TextNode, ToolDefinition, REQUEST_NODE_TEXT,
-    RESPONSE_NODE_MAIN_TEXT_FINISHED, RESPONSE_NODE_RAW_RESPONSE, RESPONSE_NODE_THINKING,
-    RESPONSE_NODE_TOOL_USE, RESPONSE_NODE_TOOL_USE_START,
-  };
+	  use crate::protocol::{
+	    AugmentChatHistory, AugmentContext, AugmentRequest, NodeIn, TextNode, ToolDefinition,
+	    REQUEST_NODE_TEXT, RESPONSE_NODE_MAIN_TEXT_FINISHED, RESPONSE_NODE_RAW_RESPONSE,
+	    RESPONSE_NODE_THINKING, RESPONSE_NODE_TOOL_USE, RESPONSE_NODE_TOOL_USE_START,
+	  };
   use pretty_assertions::assert_eq;
   use std::collections::BTreeMap;
 
@@ -2012,20 +2150,25 @@ mod tests {
         response_nodes: Vec::new(),
         structured_output_nodes: Vec::new(),
       }],
-      message: "".to_string(),
-      agent_memories: "".to_string(),
-      mode: "CHAT".to_string(),
-      prefix: "".to_string(),
-      suffix: "".to_string(),
-      lang: "".to_string(),
-      path: "".to_string(),
-      user_guidelines: "".to_string(),
-      tool_definitions: Vec::new(),
-      nodes: Vec::new(),
-      structured_request_nodes: Vec::new(),
-      request_nodes: Vec::new(),
-      conversation_id: None,
-    };
+	      message: "".to_string(),
+	      agent_memories: "".to_string(),
+	      mode: "CHAT".to_string(),
+	      prefix: "".to_string(),
+	      selected_code: "".to_string(),
+	      suffix: "".to_string(),
+	      diff: "".to_string(),
+	      lang: "".to_string(),
+	      path: "".to_string(),
+	      user_guidelines: "".to_string(),
+	      workspace_guidelines: "".to_string(),
+	      rules: Value::Null,
+	      tool_definitions: Vec::new(),
+	      nodes: Vec::new(),
+	      structured_request_nodes: Vec::new(),
+	      request_nodes: Vec::new(),
+	      conversation_id: None,
+	      context: None,
+	    };
 
     let out = convert_augment_to_anthropic(&provider, &augment, "m".to_string()).unwrap();
     assert_eq!(out.messages.len(), 2);
@@ -2053,17 +2196,21 @@ mod tests {
       extra_headers: BTreeMap::new(),
     };
 
-    let augment = AugmentRequest {
-      model: None,
-      chat_history: Vec::new(),
-      message: "hi".to_string(),
-      agent_memories: "".to_string(),
-      mode: "CHAT".to_string(),
-      prefix: "P".to_string(),
-      suffix: "".to_string(),
-      lang: "rust".to_string(),
-      path: "/tmp/main.rs".to_string(),
-      user_guidelines: "G".to_string(),
+	    let augment = AugmentRequest {
+	      model: None,
+	      chat_history: Vec::new(),
+	      message: "hi".to_string(),
+	      agent_memories: "".to_string(),
+	      mode: "CHAT".to_string(),
+	      prefix: "PREFIX_CODE_".to_string(),
+	      selected_code: "SELECTED_CODE_".to_string(),
+	      suffix: "SUFFIX_CODE".to_string(),
+	      diff: "DIFF_TEXT".to_string(),
+	      lang: "rust".to_string(),
+	      path: "/tmp/main.rs".to_string(),
+	      user_guidelines: "G".to_string(),
+	      workspace_guidelines: "".to_string(),
+	      rules: Value::Null,
       tool_definitions: vec![ToolDefinition {
         name: "t1".to_string(),
         description: "d1".to_string(),
@@ -2073,25 +2220,40 @@ mod tests {
         mcp_server_name: "".to_string(),
         mcp_tool_name: "".to_string(),
       }],
-      nodes: Vec::new(),
-      structured_request_nodes: Vec::new(),
-      request_nodes: Vec::new(),
-      conversation_id: None,
-    };
+	      nodes: Vec::new(),
+	      structured_request_nodes: Vec::new(),
+	      request_nodes: Vec::new(),
+	      conversation_id: None,
+	      context: None,
+	    };
 
     let out = convert_augment_to_anthropic(&cfg, &augment, "m".to_string()).unwrap();
     assert_eq!(out.model, "m");
     assert_eq!(out.stream, true);
     assert_eq!(out.max_tokens, 8192);
-    assert_eq!(out.tools.as_ref().unwrap().len(), 1);
-    assert_eq!(out.tool_choice.as_ref().unwrap().choice_type, "auto");
-    assert_eq!(out.thinking.as_ref().unwrap().thinking_type, "enabled");
-    assert_eq!(out.thinking.as_ref().unwrap().budget_tokens, 10000);
-    assert_eq!(out.system.as_ref().unwrap().contains("P"), true);
-    assert_eq!(out.system.as_ref().unwrap().contains("G"), true);
-    assert_eq!(out.system.as_ref().unwrap().contains("rust"), true);
-    assert_eq!(out.system.as_ref().unwrap().contains("/tmp/main.rs"), true);
-  }
+	    assert_eq!(out.tools.as_ref().unwrap().len(), 1);
+	    assert_eq!(out.tool_choice.as_ref().unwrap().choice_type, "auto");
+	    assert_eq!(out.thinking.as_ref().unwrap().thinking_type, "enabled");
+	    assert_eq!(out.thinking.as_ref().unwrap().budget_tokens, 10000);
+	    let system = out.system.as_deref().unwrap_or("");
+	    assert_eq!(system.contains("PREFIX_CODE_"), false);
+	    assert_eq!(system.contains("G"), true);
+	    assert_eq!(system.contains("rust"), true);
+	    assert_eq!(system.contains("/tmp/main.rs"), true);
+	    assert_eq!(out.messages.len(), 1);
+	    assert_eq!(out.messages[0].role, "user");
+	    let user_text = out.messages[0]
+	      .content
+	      .iter()
+	      .filter_map(|b| b.text.as_deref())
+	      .collect::<Vec<_>>()
+	      .join("\n\n");
+	    assert_eq!(user_text.contains("hi"), true);
+	    assert_eq!(user_text.contains("PREFIX_CODE_"), true);
+	    assert_eq!(user_text.contains("SELECTED_CODE_"), true);
+	    assert_eq!(user_text.contains("SUFFIX_CODE"), true);
+	    assert_eq!(user_text.contains("DIFF_TEXT"), true);
+	  }
 
   #[test]
   fn anthropic_stream_state_buffers_thinking_and_tool_use() {
@@ -2149,7 +2311,7 @@ mod tests {
   }
 
   #[test]
-  fn convert_openai_includes_tools_and_stream_options() {
+	  fn convert_openai_includes_tools_and_stream_options() {
     let provider = OpenAICompatibleProviderConfig {
       id: "o1".to_string(),
       base_url: "https://api.openai.com/v1".to_string(),
@@ -2160,17 +2322,21 @@ mod tests {
       extra_headers: BTreeMap::new(),
     };
 
-    let augment = AugmentRequest {
-      model: None,
-      chat_history: Vec::new(),
-      message: "hi".to_string(),
-      agent_memories: "".to_string(),
-      mode: "CHAT".to_string(),
-      prefix: "P".to_string(),
-      suffix: "".to_string(),
-      lang: "ts".to_string(),
-      path: "/tmp/app.ts".to_string(),
-      user_guidelines: "G".to_string(),
+	    let augment = AugmentRequest {
+	      model: None,
+	      chat_history: Vec::new(),
+	      message: "hi".to_string(),
+	      agent_memories: "".to_string(),
+	      mode: "CHAT".to_string(),
+	      prefix: "PREFIX_CODE_".to_string(),
+	      selected_code: "SELECTED_CODE_".to_string(),
+	      suffix: "SUFFIX_CODE".to_string(),
+	      diff: "DIFF_TEXT".to_string(),
+	      lang: "ts".to_string(),
+	      path: "/tmp/app.ts".to_string(),
+	      user_guidelines: "G".to_string(),
+	      workspace_guidelines: "".to_string(),
+	      rules: Value::Null,
       tool_definitions: vec![ToolDefinition {
         name: "t1".to_string(),
         description: "d1".to_string(),
@@ -2180,71 +2346,123 @@ mod tests {
         mcp_server_name: "".to_string(),
         mcp_tool_name: "".to_string(),
       }],
-      nodes: Vec::new(),
-      structured_request_nodes: Vec::new(),
-      request_nodes: Vec::new(),
-      conversation_id: None,
-    };
+	      nodes: Vec::new(),
+	      structured_request_nodes: Vec::new(),
+	      request_nodes: Vec::new(),
+	      conversation_id: None,
+	      context: None,
+	    };
 
     let out =
       convert_augment_to_openai_compatible(&provider, &augment, "gpt-4o-mini".to_string()).unwrap();
     assert_eq!(out.model, "gpt-4o-mini");
     assert_eq!(out.stream, true);
     assert_eq!(out.stream_options.as_ref().unwrap().include_usage, true);
-    assert_eq!(out.max_tokens, Some(1234));
-    assert_eq!(out.tools.as_ref().unwrap().len(), 1);
-    assert_eq!(out.tool_choice.as_ref().unwrap().as_str().unwrap(), "auto");
-    assert_eq!(out.messages[0].role, "system");
-    assert_eq!(
-      out.messages[0]
-        .content
-        .as_ref()
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .contains("P"),
-      true
-    );
-  }
+	    assert_eq!(out.max_tokens, Some(1234));
+	    assert_eq!(out.tools.as_ref().unwrap().len(), 1);
+	    assert_eq!(out.tool_choice.as_ref().unwrap().as_str().unwrap(), "auto");
+	    assert_eq!(out.messages[0].role, "system");
+	    let system = out.messages[0].content.as_ref().unwrap().as_str().unwrap();
+	    assert_eq!(system.contains("PREFIX_CODE_"), false);
+	    assert_eq!(system.contains("G"), true);
+	    assert_eq!(out.messages[1].role, "user");
+	    let user = out.messages[1].content.as_ref().unwrap().as_str().unwrap();
+	    assert_eq!(user.contains("hi"), true);
+	    assert_eq!(user.contains("PREFIX_CODE_"), true);
+	    assert_eq!(user.contains("SELECTED_CODE_"), true);
+	    assert_eq!(user.contains("SUFFIX_CODE"), true);
+	    assert_eq!(user.contains("DIFF_TEXT"), true);
+	  }
+	
+	  #[test]
+	  fn virtual_nodes_and_system_fall_back_to_context() {
+	    let augment = AugmentRequest {
+	      model: None,
+	      chat_history: Vec::new(),
+	      message: "hi".to_string(),
+	      agent_memories: "".to_string(),
+	      mode: "CHAT".to_string(),
+	      prefix: "".to_string(),
+	      selected_code: "".to_string(),
+	      suffix: "".to_string(),
+	      diff: "".to_string(),
+	      lang: "".to_string(),
+	      path: "".to_string(),
+	      user_guidelines: "G".to_string(),
+	      workspace_guidelines: "".to_string(),
+	      rules: Value::Null,
+	      tool_definitions: Vec::new(),
+	      nodes: Vec::new(),
+	      structured_request_nodes: Vec::new(),
+	      request_nodes: Vec::new(),
+	      conversation_id: None,
+	      context: Some(AugmentContext {
+	        path: "/tmp/a.go".to_string(),
+	        prefix: "P_".to_string(),
+	        selected_code: "S_".to_string(),
+	        suffix: "X".to_string(),
+	        lang: "go".to_string(),
+	        diff: "D".to_string(),
+	      }),
+	    };
+	
+	    let virtual_nodes = build_virtual_context_text_nodes(&augment);
+	    assert_eq!(virtual_nodes.len(), 2);
+	    let joined = virtual_nodes
+	      .iter()
+	      .filter_map(|n| n.text_node.as_ref().map(|t| t.content.as_str()))
+	      .collect::<Vec<_>>()
+	      .join("\n\n");
+	    assert_eq!(joined.contains("P_S_X"), true);
+	    assert_eq!(joined.contains("D"), true);
+	
+	    let system = build_system_prompt(&augment);
+	    assert_eq!(system.contains("G"), true);
+	    assert_eq!(system.contains("go"), true);
+	    assert_eq!(system.contains("/tmp/a.go"), true);
+	    assert_eq!(system.contains("P_S_X"), false);
+	  }
 
-  #[test]
-  fn openai_stream_state_buffers_tool_calls_and_finalizes() {
-    let mut state = OpenAIStreamState::default();
-    state
-      .tool_meta_by_name
-      .insert("t1".to_string(), ("mcp".to_string(), "tool".to_string()));
-    state.on_tool_call_delta(0, Some("call_1"), Some("t1"), Some("{\"q\":"));
-    state.on_tool_call_delta(0, None, None, Some("\"hi\"}"));
-    state.on_finish_reason("tool_calls");
+	  #[test]
+	  fn openai_stream_state_buffers_tool_calls_and_finalizes() {
+	    let mut state = OpenAIStreamState::default();
+	    state
+	      .tool_meta_by_name
+	      .insert("t1".to_string(), ("mcp".to_string(), "tool".to_string()));
+	    let start = state
+	      .on_tool_call_delta(0, Some("call_1"), Some("t1"), Some("{\"q\":"))
+	      .unwrap();
+	    assert_eq!(start.nodes[0].node_type, RESPONSE_NODE_TOOL_USE_START);
+	    state.on_tool_call_delta(0, None, None, Some("\"hi\"}"));
+	    state.on_finish_reason("tool_calls");
 
-    let chunks = state.finalize();
-    assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].nodes[0].node_type, RESPONSE_NODE_TOOL_USE_START);
-    assert_eq!(chunks[1].nodes[0].node_type, RESPONSE_NODE_TOOL_USE);
-    assert_eq!(
-      chunks[1].nodes[0].tool_use.as_ref().unwrap().tool_use_id,
-      "call_1"
-    );
-    assert_eq!(
-      chunks[1].nodes[0].tool_use.as_ref().unwrap().tool_name,
-      "t1"
-    );
-    assert_eq!(
-      chunks[1].nodes[0].tool_use.as_ref().unwrap().input_json,
-      "{\"q\":\"hi\"}"
-    );
-    assert_eq!(
-      chunks[1].nodes[0]
-        .tool_use
-        .as_ref()
-        .unwrap()
-        .mcp_server_name,
-      "mcp"
-    );
-    assert_eq!(
-      chunks[1].nodes[0].tool_use.as_ref().unwrap().mcp_tool_name,
-      "tool"
-    );
-    assert_eq!(chunks[2].stop_reason, Some(STOP_REASON_TOOL_USE_REQUESTED));
-  }
+	    let chunks = state.finalize();
+	    assert_eq!(chunks.len(), 2);
+	    assert_eq!(chunks[0].nodes[0].node_type, RESPONSE_NODE_TOOL_USE);
+	    assert_eq!(
+	      chunks[0].nodes[0].tool_use.as_ref().unwrap().tool_use_id,
+	      "call_1"
+	    );
+	    assert_eq!(
+	      chunks[0].nodes[0].tool_use.as_ref().unwrap().tool_name,
+	      "t1"
+	    );
+	    assert_eq!(
+	      chunks[0].nodes[0].tool_use.as_ref().unwrap().input_json,
+	      "{\"q\":\"hi\"}"
+	    );
+	    assert_eq!(
+	      chunks[0].nodes[0]
+	        .tool_use
+	        .as_ref()
+	        .unwrap()
+	        .mcp_server_name,
+	      "mcp"
+	    );
+	    assert_eq!(
+	      chunks[0].nodes[0].tool_use.as_ref().unwrap().mcp_tool_name,
+	      "tool"
+	    );
+	    assert_eq!(chunks[1].stop_reason, Some(STOP_REASON_TOOL_USE_REQUESTED));
+	  }
 }
